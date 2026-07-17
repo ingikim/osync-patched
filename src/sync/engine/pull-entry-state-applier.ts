@@ -252,10 +252,26 @@ export class PullEntryStateApplier {
       manifest,
       options,
     );
+    // Only plans that will actually write file content to disk need blob bytes.
+    // A plan whose final path is excluded by this device's file rules must not
+    // have its blob downloaded at all: on constrained devices (e.g. the iOS
+    // WebView) eagerly downloading multi-10MB excluded blobs just to discard
+    // them can exhaust memory and crash-loop the pull window forever. Excluded
+    // plans still flow through the rest of the pipeline so their remote state
+    // is recorded and the cursor advances (see isDiskWritablePath above).
+    const blobRequiredPlans = new Set(
+      plannedEntries.filter(
+        (plan) =>
+          !!plan.finalPath &&
+          !plan.state.deleted &&
+          plan.state.entryType !== "folder" &&
+          this.isDiskWritablePath(plan.finalPath),
+      ),
+    );
     const preparedBlobs = await this.blobPreparer.preparePathBatchBlobs(
       store,
       token,
-      plannedEntries,
+      [...blobRequiredPlans],
     );
     const blobByPlan = new Map(preparedBlobs.map((blob) => [blob.plan, blob]));
 
@@ -263,13 +279,12 @@ export class PullEntryStateApplier {
     // has no prepared blob. Drop it so it is neither written to disk nor recorded
     // in the store — the healthy entries still apply and the cursor advances past
     // the poison entry instead of re-downloading the whole batch forever.
-    const plans = plannedEntries.filter((plan) => {
-      const needsBlob =
-        !!plan.finalPath &&
-        !plan.state.deleted &&
-        plan.state.entryType !== "folder";
-      return !needsBlob || blobByPlan.has(plan);
-    });
+    // Excluded plans also carry no blob, but they were never sent to the blob
+    // preparer and must NOT be dropped: their remote state has to be recorded
+    // so they are not re-fetched on every pull.
+    const plans = plannedEntries.filter(
+      (plan) => !blobRequiredPlans.has(plan) || blobByPlan.has(plan),
+    );
     const pathsToWrite = uniqueSyncPaths(plans.map((plan) => plan.finalPath));
     const pendingConflicts: PreparedPendingConflict[] = [];
     const preparedPendingMutationIds = new Set<string>();
