@@ -1,5 +1,6 @@
 import type { ConflictFileWriter } from "../core/conflict-file";
 import { mapWithConcurrency } from "../core/concurrency";
+import { ByteBudget } from "../core/byte-budget";
 import type { SyncCryptoService } from "../core/crypto-service";
 import type { SyncTokenResponse } from "../remote/client";
 import type { RemoteEntryState } from "../remote/changes";
@@ -25,7 +26,11 @@ import {
 } from "../core/path-limits";
 import { shouldSyncPath, type SyncFileRules } from "../core/file-rules";
 import type { SyncEventGateLike } from "./event-gate";
-import { PullBlobPreparer } from "./pull-blob-preparer";
+import {
+  DEFAULT_PULL_BLOB_BUDGET_BYTES,
+  DEFAULT_PULL_BLOB_PROVISIONAL_BYTES,
+  PullBlobPreparer,
+} from "./pull-blob-preparer";
 import { PullManifestPlanner, type PullManifestStore } from "./pull-manifest-planner";
 import { PullPendingMutationHandler } from "./pull-pending-mutation-handler";
 import {
@@ -59,6 +64,14 @@ export interface PullEntryStateApplierDeps {
   onProgress?: (progress: SyncProgressCounts) => Promise<void>;
   onConflict?: (event: PullConflictEvent) => void;
   now?: () => number;
+  // Byte-budgeted admission gate bounding how much downloaded blob content a
+  // pull sub-window may hold in memory at once. Defaults to a shared
+  // ByteBudget of DEFAULT_PULL_BLOB_BUDGET_BYTES; pass a smaller budget on
+  // memory-constrained platforms (mobile WebViews).
+  blobByteBudget?: ByteBudget;
+  blobProvisionalBytes?: number;
+  // See PreparePathBatchBlobsBudget.calibrationConcurrency. Omit to disable.
+  blobCalibrationConcurrency?: number;
   // Notified (best-effort) when a remote entry could not be decrypted and was
   // quarantined, so callers can surface a diagnostic. Never throws the pull.
   onDecryptFailure?: (entryId: string) => void;
@@ -116,11 +129,17 @@ export class PullEntryStateApplier {
   private readonly blobPreparer: PullBlobPreparer;
   private readonly manifestPlanner: PullManifestPlanner;
   private readonly pendingMutations: PullPendingMutationHandler;
+  private readonly blobBudget: ByteBudget;
+  private readonly blobProvisionalBytes: number;
 
   constructor(private readonly deps: PullEntryStateApplierDeps) {
     this.blobPreparer = new PullBlobPreparer(deps);
     this.manifestPlanner = new PullManifestPlanner(deps);
     this.pendingMutations = new PullPendingMutationHandler(deps);
+    this.blobBudget =
+      deps.blobByteBudget ?? new ByteBudget(DEFAULT_PULL_BLOB_BUDGET_BYTES);
+    this.blobProvisionalBytes =
+      deps.blobProvisionalBytes ?? DEFAULT_PULL_BLOB_PROVISIONAL_BYTES;
   }
 
   // A remote path that this device's file rules exclude (e.g. an excluded folder)
@@ -206,38 +225,68 @@ export class PullEntryStateApplier {
       };
     },
   ): Promise<PullEntryStateWindowApplyResult> {
-    if (manifest.length === 0) {
-      return {
-        entriesApplied: 0,
-        filesWritten: 0,
-        filesDeleted: 0,
-        conflictsCreated: 0,
-        deferred: [],
-      };
-    }
+    const totals = {
+      entriesApplied: 0,
+      filesWritten: 0,
+      filesDeleted: 0,
+      conflictsCreated: 0,
+    };
+    const deferred: PullEntryStateManifestItem[] = [];
 
-    const prepared = await this.prepareManifestApplication(store, token, manifest, {
-      deferExternalPathOwners: !options.finalWindow,
-    });
-    const filesDeleted = await this.applyPreparedManifest(
-      store,
-      prepared,
-      options.progress,
-      options.skipDeletions ?? false,
-    );
+    // The window is processed as one or more byte-budgeted sub-windows: blob
+    // preparation stops admitting downloads when the budget fills, the
+    // admitted plans are applied and their bytes released, and the remainder
+    // loops through the same prepare→apply machinery. Each sub-window is a
+    // normal, smaller window — the store checkpoint/ack-cursor still happens
+    // only after the WHOLE window returns (in pull-service), unchanged.
+    let items = manifest;
+    while (items.length > 0) {
+      const prepared = await this.prepareManifestApplication(store, token, items, {
+        deferExternalPathOwners: !options.finalWindow,
+      });
+      // Defensive: the preparer always admits at least the first dependency
+      // group, so the remainder must strictly shrink; never loop forever.
+      if (prepared.remainderItems.length >= items.length) {
+        prepared.releaseBlobBudget();
+        throw new Error(
+          "[osync] pull: blob budget made no progress on a manifest sub-window",
+        );
+      }
+      let filesDeleted = 0;
+      try {
+        filesDeleted = await this.applyPreparedManifest(
+          store,
+          prepared,
+          options.progress
+            ? {
+                completedOffset:
+                  options.progress.completedOffset + totals.entriesApplied,
+                totalEntries: options.progress.totalEntries,
+              }
+            : undefined,
+          options.skipDeletions ?? false,
+        );
+      } finally {
+        prepared.releaseBlobBudget();
+      }
 
-    return {
-      entriesApplied: prepared.plans.length,
-      filesWritten: prepared.pathsToWrite.length,
-      filesDeleted,
-      conflictsCreated: prepared.plans.reduce(
+      totals.entriesApplied += prepared.plans.length;
+      totals.filesWritten += prepared.pathsToWrite.length;
+      totals.filesDeleted += filesDeleted;
+      totals.conflictsCreated += prepared.plans.reduce(
         (count, plan) =>
           count +
           (plan.pathConflict?.conflictPath ? 1 : 0) +
           (plan.pendingConflict?.conflictPath ? 1 : 0),
         0,
-      ),
-      deferred: prepared.deferred,
+      );
+      deferred.push(...prepared.deferred);
+      items = prepared.remainderItems;
+    }
+
+    return {
+      ...totals,
+      deferred,
     };
   }
 
@@ -268,12 +317,27 @@ export class PullEntryStateApplier {
           this.isDiskWritablePath(plan.finalPath),
       ),
     );
-    const preparedBlobs = await this.blobPreparer.preparePathBatchBlobs(
+    // Blob downloads are admitted per path-dependency GROUP against the byte
+    // budget: groups that do not fit are returned as `remainder` and become
+    // the next sub-window (see applyManifestWindow). Group granularity keeps
+    // rename/delete/write chains that share paths in one sub-window, so their
+    // relative ordering is never split across sub-windows.
+    const planGroups = createPathDependencyBatches(plannedEntries);
+    const preparedBlobResult = await this.blobPreparer.preparePathBatchBlobs(
       store,
       token,
-      [...blobRequiredPlans],
+      planGroups,
+      blobRequiredPlans,
+      {
+        budget: this.blobBudget,
+        provisionalBytes: this.blobProvisionalBytes,
+        calibrationConcurrency: this.deps.blobCalibrationConcurrency,
+      },
     );
-    const blobByPlan = new Map(preparedBlobs.map((blob) => [blob.plan, blob]));
+    const blobByPlan = new Map(
+      preparedBlobResult.blobs.map((blob) => [blob.plan, blob]),
+    );
+    const remainderSet = new Set(preparedBlobResult.remainder);
 
     // A plan whose blob was quarantined (permanent download-verification failure)
     // has no prepared blob. Drop it so it is neither written to disk nor recorded
@@ -281,9 +345,12 @@ export class PullEntryStateApplier {
     // the poison entry instead of re-downloading the whole batch forever.
     // Excluded plans also carry no blob, but they were never sent to the blob
     // preparer and must NOT be dropped: their remote state has to be recorded
-    // so they are not re-fetched on every pull.
+    // so they are not re-fetched on every pull. Remainder plans (budget) are
+    // carried into the next sub-window instead of being applied here.
     const plans = plannedEntries.filter(
-      (plan) => !blobRequiredPlans.has(plan) || blobByPlan.has(plan),
+      (plan) =>
+        !remainderSet.has(plan) &&
+        (!blobRequiredPlans.has(plan) || blobByPlan.has(plan)),
     );
     const pathsToWrite = uniqueSyncPaths(plans.map((plan) => plan.finalPath));
     const pendingConflicts: PreparedPendingConflict[] = [];
@@ -330,6 +397,11 @@ export class PullEntryStateApplier {
       pendingConflicts,
       batches,
       deferred,
+      remainderItems: preparedBlobResult.remainder.map((plan) => ({
+        state: plan.state,
+        metadata: plan.metadata,
+      })),
+      releaseBlobBudget: preparedBlobResult.release,
     };
   }
 

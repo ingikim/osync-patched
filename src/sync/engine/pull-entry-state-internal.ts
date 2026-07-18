@@ -84,6 +84,12 @@ export type PreparedManifestApplication = {
   pendingConflicts: PreparedPendingConflict[];
   batches: PreparedPathBatch[];
   deferred: PullEntryStateManifestItem[];
+  // Manifest items whose blob downloads were not admitted within the byte
+  // budget; the caller applies + releases this preparation, then runs these
+  // through another prepare→apply pass (the next sub-window).
+  remainderItems: PullEntryStateManifestItem[];
+  // Releases every byte this preparation holds against the blob budget.
+  releaseBlobBudget: () => void;
 };
 
 export type SnapshotEntryState = {

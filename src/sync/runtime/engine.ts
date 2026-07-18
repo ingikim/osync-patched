@@ -1,5 +1,11 @@
+import { Platform } from "obsidian";
 import type { Plugin } from "obsidian";
 
+import { ByteBudget } from "../core/byte-budget";
+import {
+  DEFAULT_PULL_BLOB_BUDGET_BYTES,
+  MOBILE_PULL_BLOB_BUDGET_BYTES,
+} from "../engine/pull-blob-preparer";
 import { hashBytes } from "../core/content";
 import { SyncAutoLoop } from "../engine/auto-sync";
 import type { SyncTokenResponse } from "../remote/client";
@@ -210,6 +216,17 @@ export class SyncEngine {
     eventGate: this.syncEventGate,
     vaultAdapter: this.vaultAdapter,
     pullClient: this.syncPullClient,
+    // Mobile WebViews (iOS especially) die under a fraction of the memory
+    // pressure desktop Electron tolerates; hold less downloaded blob content
+    // there so multi-10MB media windows cannot crash-loop the initial pull.
+    blobByteBudget: new ByteBudget(
+      Platform.isMobile
+        ? MOBILE_PULL_BLOB_BUDGET_BYTES
+        : DEFAULT_PULL_BLOB_BUDGET_BYTES,
+    ),
+    // On mobile, serialize the first download of each sub-window so one large
+    // media file calibrates the size estimate before more downloads pile on.
+    blobCalibrationConcurrency: Platform.isMobile ? 1 : undefined,
     getSyncFileRules: () => this.deps.getSyncFileRules(),
     onProgress: async (progress) => {
       this.reportActivityProgress(progress);

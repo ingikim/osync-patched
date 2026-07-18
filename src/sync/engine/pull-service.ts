@@ -1,4 +1,5 @@
 import type { SyncTokenResponse } from "../remote/client";
+import type { ByteBudget } from "../core/byte-budget";
 import type { SyncEventGateLike } from "./event-gate";
 import { SyncPullClient } from "../remote/pull-client";
 import type { SyncCryptoService } from "../core/crypto-service";
@@ -31,6 +32,9 @@ export interface SyncPullServiceDeps {
   pullClient?: Pick<SyncPullClient, "downloadBlob">;
   prepareConcurrency?: number;
   applyWindowSize?: number;
+  blobByteBudget?: ByteBudget;
+  blobProvisionalBytes?: number;
+  blobCalibrationConcurrency?: number;
   onProgress: (progress: SyncProgressCounts) => Promise<void>;
   onConflict?: (event: PullConflictEvent) => void;
   // Notified (best-effort) when a remote entry is quarantined because it can
@@ -70,6 +74,9 @@ export class SyncPullService {
       pullClient: this.pullClient,
       prepareConcurrency:
         this.deps.prepareConcurrency ?? DEFAULT_PULL_PREPARE_CONCURRENCY,
+      blobByteBudget: this.deps.blobByteBudget,
+      blobProvisionalBytes: this.deps.blobProvisionalBytes,
+      blobCalibrationConcurrency: this.deps.blobCalibrationConcurrency,
       onProgress: async (progress) => {
         await this.deps.onProgress(progress);
       },
